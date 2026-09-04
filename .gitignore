@@ -1,0 +1,17 @@
+# .NET build output
+**/bin/
+**/obj/
+
+# Local packaged binaries and scratch files
+outputs/
+work/
+
+# IDE and user-specific files
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS metadata
+Thumbs.db
+.DS_Store
