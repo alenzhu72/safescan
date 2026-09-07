@@ -4,7 +4,7 @@ using System.Runtime.CompilerServices;
 namespace SafeScan.Models;
 
 public enum RiskLevel { Info, Low, Medium, High, Critical }
-public enum FindingKind { File, Registry, Startup, ScheduledTask, BrowserExtension, Defender }
+public enum FindingKind { File, Registry, Startup, ScheduledTask, BrowserExtension, PasswordExposure, Process, Service, Defender }
 
 public sealed class ScanFinding : INotifyPropertyChanged
 {

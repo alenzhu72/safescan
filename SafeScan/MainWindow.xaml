@@ -4,7 +4,7 @@
     <DockPanel Margin="0,0,0,16">
       <StackPanel>
         <TextBlock Text="SafeScan" FontSize="30" FontWeight="Bold" Foreground="#172033"/>
-        <TextBlock Text="信息窃取木马与浏览器凭据风险排查 · 不会自动删除任何文件" Foreground="#526078" FontSize="14"/>
+        <TextBlock Text="密码盗取线索 · 键盘监听/可疑服务 · 木马持久化（排除 OneDrive 与 WPS 网盘）" Foreground="#526078" FontSize="14"/>
       </StackPanel>
       <Border DockPanel.Dock="Right" Background="#E8F2FF" CornerRadius="8" Padding="14,8" HorizontalAlignment="Right"><TextBlock Text="默认操作：隔离" Foreground="#1764C0" FontWeight="SemiBold"/></Border>
     </DockPanel>

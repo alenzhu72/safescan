@@ -29,8 +29,9 @@ public sealed class ScannerService
         {
             foreach (var root in roots) { token.ThrowIfCancellationRequested(); progress($"正在检查 {root}"); ScanDirectory(root, found, token); }
             progress("正在检查 Run / RunOnce 注册表项"); ScanRegistry(found);
+            progress("正在检查可疑后台进程和服务"); ScanRunningProcesses(found); ScanServices(found);
             progress("正在检查计划任务"); ScanScheduledTasks(found, token);
-            progress("正在检查浏览器扩展"); ScanBrowserExtensions(user, found, token);
+            progress("正在检查浏览器密码风险与扩展"); ScanBrowserCredentialRisk(user, found); ScanBrowserExtensions(user, found, token);
         }, token);
     }
 
@@ -56,7 +57,20 @@ public sealed class ScannerService
 
     private static bool IsExcluded(string p) => p.Contains("\\SafeScan\\Quarantine", StringComparison.OrdinalIgnoreCase)
         || p.Contains("\\AppData\\Local\\Packages\\", StringComparison.OrdinalIgnoreCase)
-        || p.Contains("\\node_modules\\", StringComparison.OrdinalIgnoreCase);
+        || p.Contains("\\node_modules\\", StringComparison.OrdinalIgnoreCase)
+        || HasDirectorySegment(p, "OneDrive")
+        || HasDirectorySegment(p, "OneDriveTemp")
+        || HasDirectorySegment(p, "WPS Cloud Files")
+        || HasDirectorySegment(p, "WPSDrive")
+        || HasDirectorySegment(p, "WPS Cloud Drive")
+        || HasDirectorySegment(p, "Kingsoft Cloud Files");
+
+    private static bool HasDirectorySegment(string path, string name)
+    {
+        var normalized = path.TrimEnd('\\', '/');
+        return normalized.EndsWith($"\\{name}", StringComparison.OrdinalIgnoreCase)
+            || normalized.Contains($"\\{name}\\", StringComparison.OrdinalIgnoreCase);
+    }
 
     private void AnalyzeFile(string path, Action<ScanFinding> found, string? extraReason = null, FindingKind kind = FindingKind.File)
     {
@@ -80,7 +94,9 @@ public sealed class ScannerService
             if (doubleExt) reasons.Add("疑似双扩展名");
             if (recent) reasons.Add("近 30 天创建");
             if (sig.Status == "未签名" && new[] { ".exe", ".dll", ".scr" }.Contains(ext)) reasons.Add("未发现数字签名");
-            var score = (temp ? 2 : 0) + (startup ? 3 : 0) + (script ? 1 : 0) + (doubleExt ? 2 : 0) + (recent ? 1 : 0) + (sig.Status == "未签名" ? 1 : 0) + (extraReason is null ? 0 : 2);
+            var capability = InspectCapabilities(fi, sig.IsMicrosoft);
+            if (capability.Reason is not null) reasons.Add(capability.Reason);
+            var score = (temp ? 2 : 0) + (startup ? 3 : 0) + (script ? 1 : 0) + (doubleExt ? 2 : 0) + (recent ? 1 : 0) + (sig.Status == "未签名" ? 1 : 0) + (extraReason is null ? 0 : 2) + capability.Score;
             if (score < 2 && extraReason is null) return;
             var protectedFile = system || sig.IsMicrosoft;
             found(new ScanFinding
@@ -91,6 +107,22 @@ public sealed class ScannerService
                 Protected = protectedFile, ProtectionReason = system ? "系统/程序目录受保护" : sig.IsMicrosoft ? "Microsoft 签名文件受保护" : ""
             });
         } catch { }
+    }
+
+    private static (int Score, string? Reason) InspectCapabilities(FileInfo file, bool isMicrosoft)
+    {
+        if (isMicrosoft || file.Length <= 0 || file.Length > 20 * 1024 * 1024 || !new[] { ".exe", ".dll", ".scr" }.Contains(file.Extension, StringComparer.OrdinalIgnoreCase)) return (0, null);
+        try
+        {
+            var text = Encoding.ASCII.GetString(File.ReadAllBytes(file.FullName));
+            var keyboard = text.Contains("GetAsyncKeyState", StringComparison.Ordinal) || text.Contains("SetWindowsHookEx", StringComparison.Ordinal) || text.Contains("GetRawInputData", StringComparison.Ordinal);
+            var credential = text.Contains("Login Data", StringComparison.OrdinalIgnoreCase) && (text.Contains("CryptUnprotectData", StringComparison.Ordinal) || text.Contains("Local State", StringComparison.OrdinalIgnoreCase));
+            if (keyboard && credential) return (5, "同时包含键盘监听与浏览器凭据访问特征");
+            if (credential) return (4, "包含浏览器凭据数据库及解密 API 特征");
+            if (keyboard) return (3, "包含键盘输入监听 API 特征（也可能是正常热键软件）");
+        }
+        catch { }
+        return (0, null);
     }
 
     private static string Hash(string path)
@@ -131,6 +163,73 @@ public sealed class ScannerService
         if (command.StartsWith('"')) { var end = command.IndexOf('"', 1); return end > 1 ? command[1..end] : null; }
         foreach (var ext in Interesting) { var i = command.IndexOf(ext, StringComparison.OrdinalIgnoreCase); if (i >= 0) return command[..(i + ext.Length)].Trim(); }
         return null;
+    }
+
+    private void ScanRunningProcesses(Action<ScanFinding> found)
+    {
+        var user = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        foreach (var process in Process.GetProcesses())
+        {
+            try
+            {
+                var path = process.MainModule?.FileName;
+                if (path is null || !File.Exists(path) || IsExcluded(path)) continue;
+                var inUserArea = path.StartsWith(user, StringComparison.OrdinalIgnoreCase) || path.Contains("\\Temp\\", StringComparison.OrdinalIgnoreCase);
+                if (!inUserArea) continue;
+                var sig = ProtectionService.GetSignature(path);
+                if (sig.Status != "签名有效") AnalyzeFile(path, found, $"当前运行进程：{process.ProcessName}（未验证到可信签名）", FindingKind.Process);
+            }
+            catch { }
+            finally { process.Dispose(); }
+        }
+    }
+
+    private void ScanServices(Action<ScanFinding> found)
+    {
+        try
+        {
+            using var services = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services");
+            if (services is null) return;
+            foreach (var name in services.GetSubKeyNames())
+            {
+                try
+                {
+                    using var key = services.OpenSubKey(name);
+                    var command = key?.GetValue("ImagePath")?.ToString();
+                    if (string.IsNullOrWhiteSpace(command) || IsExcluded(command)) continue;
+                    var path = ExtractPath(command);
+                    if (path is null || !File.Exists(path)) continue;
+                    var userWritable = path.Contains("\\Users\\", StringComparison.OrdinalIgnoreCase) || path.Contains("\\Temp\\", StringComparison.OrdinalIgnoreCase) || path.Contains("\\AppData\\", StringComparison.OrdinalIgnoreCase);
+                    if (userWritable) AnalyzeFile(path, found, $"Windows 服务 {name} 从用户可写目录启动", FindingKind.Service);
+                }
+                catch { }
+            }
+        }
+        catch { }
+    }
+
+    private static void ScanBrowserCredentialRisk(string user, Action<ScanFinding> found)
+    {
+        var profiles = new[]
+        {
+            ("Chrome", Path.Combine(user, @"AppData\Local\Google\Chrome\User Data")),
+            ("Edge", Path.Combine(user, @"AppData\Local\Microsoft\Edge\User Data"))
+        };
+        foreach (var (browser, root) in profiles.Where(x => Directory.Exists(x.Item2)))
+        {
+            try
+            {
+                var databases = Directory.EnumerateFiles(root, "Login Data", SearchOption.AllDirectories).ToList();
+                if (databases.Count == 0) continue;
+                found(new ScanFinding
+                {
+                    Risk = RiskLevel.Info, Kind = FindingKind.PasswordExposure, Path = $"{browser} 保存的密码数据库（{databases.Count} 个配置文件）",
+                    Reason = "检测到本机保存密码。数据通常受 Windows 加密保护，但若信息窃取木马曾以当前用户身份运行，密码可能已被读取；本机扫描无法证明是否已外传。建议在可信设备上更换重要密码并撤销会话。",
+                    SignatureStatus = "不适用", Protected = true, ProtectionReason = "浏览器数据只检查，不允许删除", Status = "需采取账户措施"
+                });
+            }
+            catch { }
+        }
     }
 
     private void ScanScheduledTasks(Action<ScanFinding> found, CancellationToken token)
